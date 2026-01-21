@@ -159,3 +159,371 @@ def test_that_pullback_of_pushforward_equals_input(n, p, phi):
 
     # Due to no update, we should have equality
     assert np.allclose(U, U_posterior, atol=1e-12)
+
+
+@pytest.mark.parametrize("n, p, m", [(500, 50, 10)])
+def test_that_partial_fit_H_learns_signal(n, p, m):
+    """Test that partial_fit_H learns the true signal features."""
+    rng = np.random.default_rng(42)
+
+    # Create simple H: each response depends on a single feature
+    H_true_dense = np.zeros((m, p))
+    signal_features = list(range(m))  # First m features are signal
+    for j in range(m):
+        H_true_dense[j, signal_features[j]] = 1.0 + rng.standard_normal() * 0.1
+    H_true = sp.sparse.csc_matrix(H_true_dense)
+
+    # Generate data
+    U = rng.standard_normal((n, p))
+    noise = rng.standard_normal((n, m)) * 0.01  # Low noise
+    Y = U @ H_true.T + noise
+
+    # Create EnIF
+    Graph_u = create_ar1_graph(p)
+    Prec_eps = sp.sparse.eye(m, format="csc")
+    gtmap = EnIF(Graph_u=Graph_u, Prec_eps=Prec_eps)
+
+    # Use partial_fit_H with two-pass workflow
+    gtmap.init_partial_fit_H(
+        p=p,
+        m=m,
+        alpha=0.0001,
+        l1_ratio=0.9,
+        random_state=0,
+    )
+
+    batch_size = 100
+
+    # Pass 1: Compute global statistics
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        gtmap.partial_fit_scaler_H(U[start:end], Y[start:end])
+
+    # Pass 2: Train the model (multiple epochs)
+    n_epochs = 5
+    for _ in range(n_epochs):
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            gtmap.partial_fit_H(U[start:end], Y[start:end])
+
+    gtmap.finalize_fit_H()
+
+    # Check that the learned H identifies the correct signal features
+    H_learned = gtmap.H.toarray()
+    for j in range(m):
+        # The signal feature should be among the strongest coefficients
+        top_k = 3
+        top_features = np.argsort(np.abs(H_learned[j, :]))[-top_k:]
+        assert signal_features[j] in top_features, (
+            f"Response {j}: expected feature {signal_features[j]} in top-{top_k}, "
+            f"got {top_features}"
+        )
+
+
+def test_partial_fit_H_raises_without_init():
+    """Test that partial_fit_H raises error if init not called."""
+    Graph_u = create_ar1_graph(10)
+    Prec_eps = sp.sparse.eye(5, format="csc")
+    gtmap = EnIF(Graph_u=Graph_u, Prec_eps=Prec_eps)
+
+    with pytest.raises(RuntimeError, match="Must call init_partial_fit_H"):
+        gtmap.partial_fit_H(np.zeros((10, 10)), np.zeros((10, 5)))
+
+
+def test_finalize_fit_H_raises_without_partial_fit():
+    """Test that finalize_fit_H raises error if partial_fit not called."""
+    Graph_u = create_ar1_graph(10)
+    Prec_eps = sp.sparse.eye(5, format="csc")
+    gtmap = EnIF(Graph_u=Graph_u, Prec_eps=Prec_eps)
+
+    gtmap.init_partial_fit_H(p=10, m=5)
+
+    with pytest.raises(RuntimeError, match="Must call partial_fit"):
+        gtmap.finalize_fit_H()
+
+
+def test_two_pass_workflow_with_distribution_shift():
+    """Test the two-pass workflow (fit scaler -> fit model) on shifted data.
+
+    This test simulates a scenario where data comes in blocks with vastly
+    different statistics (e.g., porosity then permeability). A standard
+    online learning approach might fail or perform poorly if the warmup
+    period only sees the first block. The two-pass approach ensures correct
+    global scaling.
+
+    The test also performs a full EnIF transport to verify the learned H works
+    in a complete posterior update workflow.
+    """
+    rng = np.random.default_rng(42)
+    p = 50
+    m = 5
+    batch_size = 500
+
+    # Create simple H: response j depends on feature j
+    H_true = sp.sparse.lil_matrix((m, p))
+    for j in range(m):
+        H_true[j, j] = 1.0
+    H_true = H_true.tocsc()
+
+    # Generate data with EXTREME distribution shift
+    # Block 1 (First 500 samples): Mean +100
+    U1 = rng.standard_normal((batch_size, p)) + 100.0
+    Y1 = U1 @ H_true.T + rng.standard_normal((batch_size, m)) * 0.1
+
+    # Block 2 (Next 500 samples): Mean -100
+    U2 = rng.standard_normal((batch_size, p)) - 100.0
+    Y2 = U2 @ H_true.T + rng.standard_normal((batch_size, m)) * 0.1
+
+    # If we treated this as a stream, we have two large batches
+    batches = [(U1, Y1), (U2, Y2)]
+
+    # Combined data for full EnIF workflow
+    U = np.vstack([U1, U2])
+    Y = np.vstack([Y1, Y2])
+
+    # Setup EnIF
+    Graph_u = create_ar1_graph(p)
+    Prec_eps = sp.sparse.eye(m, format="csc")
+    gtmap = EnIF(Graph_u=Graph_u, Prec_eps=Prec_eps)
+
+    # Initialize
+    gtmap.init_partial_fit_H(
+        p=p,
+        m=m,
+        alpha=0.01,  # Moderate alpha for sparsity while still learning signal
+        l1_ratio=0.95,
+        random_state=42,
+    )
+
+    # --- PASS 1: Global Statistics Calculation ---
+    # Iterate over the full dataset just to update the scaler.
+    for U_batch, Y_batch in batches:
+        gtmap.partial_fit_scaler_H(U_batch, Y_batch)
+
+    # --- PASS 2: Model Training ---
+    # Iterate over the full dataset again to train the model.
+    # The scaler is automatically frozen using stats from Pass 1.
+    # We run multiple epochs to ensure convergence
+    n_epochs = 10
+    for _ in range(n_epochs):
+        for U_batch, Y_batch in batches:
+            gtmap.partial_fit_H(U_batch, Y_batch)
+
+    gtmap.finalize_fit_H()
+
+    # Verify learning: The diagonal elements should be dominant
+    H_learned = gtmap.H.toarray()
+    for j in range(m):
+        # Check that the true feature (j) has the largest coefficient
+        predicted_feature = np.argmax(np.abs(H_learned[j, :]))
+        assert predicted_feature == j, (
+            f"Response {j} incorrectly mapped to feature {predicted_feature} "
+            f"instead of {j}. Two-pass scaling might have failed."
+        )
+
+    # H matrix should exist and have correct shape
+    assert gtmap.H is not None, "H matrix should be created"
+    assert gtmap.H.shape == (m, p), f"H should have shape ({m}, {p})"
+
+    # --- Full EnIF Run ---
+    # Fit precision matrix
+    gtmap.fit_precision(U)
+
+    # Define observation
+    d = np.zeros(m)
+    for j in range(m):
+        d[j] = np.mean(Y[:, j])  # Observe mean response
+
+    # Run full transport to posterior
+    U_posterior = gtmap.transport(U, Y, d, seed=42)
+
+    # Verify posterior has same shape as prior
+    assert U_posterior.shape == U.shape, "Posterior should have same shape as prior"
+
+    # Verify posterior is different from prior (update happened)
+    assert not np.allclose(U_posterior, U, atol=1e-6), (
+        "Posterior should differ from prior after conditioning"
+    )
+
+
+@pytest.mark.parametrize("n, p, m", [(500, 50, 5)])
+def test_online_learning_comparable_to_lasso(n, p, m):
+    """Test that online learning produces results comparable to LASSO.
+
+    Both methods should:
+    1. Learn the true signal features (identify which features matter)
+    2. Produce predictions that correlate with ground truth
+    3. Achieve some level of sparsity
+
+    Note: LASSO uses coordinate descent which can drive coefficients exactly to zero,
+    while online SGD with L1 penalty (via ElasticNet) only approximates this behavior.
+    However, with appropriate sparsity thresholding, online SGD can achieve similar sparsity.
+    """
+    rng = np.random.default_rng(42)
+    batch_size = 100
+    n_true_features = 3  # Number of true non-zero features per response
+
+    # Create sparse ground truth H (only n_true_features non-zero entries per response)
+    H_true_dense = np.zeros((m, p))
+    for j in range(m):
+        nonzero_indices = rng.choice(p, size=n_true_features, replace=False)
+        H_true_dense[j, nonzero_indices] = rng.standard_normal(n_true_features)
+    H_true = sp.sparse.csc_matrix(H_true_dense)
+
+    # Generate synthetic data: Y = U @ H.T + noise
+    U = rng.standard_normal((n, p))
+    noise = rng.standard_normal((n, m)) * 0.1
+    Y = U @ H_true.T + noise
+
+    # --- LASSO approach ---
+    Graph_u = create_ar1_graph(p)
+    Prec_eps = sp.sparse.eye(m, format="csc")
+    gtmap_lasso = EnIF(Graph_u=Graph_u, Prec_eps=Prec_eps)
+    gtmap_lasso.fit_H(U, Y, learning_algorithm="LASSO")
+    H_lasso = gtmap_lasso.H
+
+    # --- Influence-boost approach ---
+    gtmap_boost = EnIF(Graph_u=Graph_u, Prec_eps=Prec_eps)
+    gtmap_boost.fit_H(U, Y, learning_algorithm="influence-boost")
+    H_boost = gtmap_boost.H
+
+    # --- Online learning approach ---
+    gtmap_online = EnIF(Graph_u=Graph_u, Prec_eps=Prec_eps)
+    gtmap_online.init_partial_fit_H(
+        p=p,
+        m=m,
+        alpha=0.01,  # Higher alpha for sparsity
+        l1_ratio=0.95,
+        random_state=42,
+        sparsity_threshold=0.01,
+    )
+
+    # Pass 1: Compute global statistics
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        gtmap_online.partial_fit_scaler_H(U[start:end], Y[start:end])
+
+    # Pass 2: Train the model (multiple epochs for convergence)
+    n_epochs = 10
+    for _ in range(n_epochs):
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            gtmap_online.partial_fit_H(U[start:end], Y[start:end])
+
+    gtmap_online.finalize_fit_H()
+    H_online = gtmap_online.H
+
+    # All should have same shape
+    assert H_lasso.shape == H_online.shape == H_boost.shape == (m, p)
+
+    # Compare sparsity levels
+    lasso_nnz = H_lasso.nnz
+    online_nnz = H_online.nnz
+    boost_nnz = H_boost.nnz
+    true_nnz = m * n_true_features  # Ground truth has exactly this many non-zeros
+    total_elements = m * p
+
+    lasso_sparsity = 1.0 - (lasso_nnz / total_elements)
+    online_sparsity = 1.0 - (online_nnz / total_elements)
+    boost_sparsity = 1.0 - (boost_nnz / total_elements)
+    true_sparsity = 1.0 - (true_nnz / total_elements)
+
+    # Print sparsity comparison for visibility
+    print("\nSparsity comparison:")
+    print(f"  Ground truth: {true_sparsity:.1%} sparse ({true_nnz} non-zeros)")
+    print(f"  LASSO:        {lasso_sparsity:.1%} sparse ({lasso_nnz} non-zeros)")
+    print(f"  Online SGD:   {online_sparsity:.1%} sparse ({online_nnz} non-zeros)")
+    print(f"  Influence-boost: {boost_sparsity:.1%} sparse ({boost_nnz} non-zeros)")
+    if lasso_nnz < online_nnz:
+        print(f"  LASSO has {online_nnz - lasso_nnz} fewer non-zeros than online")
+    else:
+        print(f"  Online has {lasso_nnz - online_nnz} fewer non-zeros than LASSO")
+
+    # LASSO should be reasonably sparse
+    assert lasso_sparsity > 0.3, f"LASSO H should be sparse, got {lasso_sparsity:.2%}"
+    # Online learning may be less sparse due to SGD optimization path
+    assert online_sparsity > 0.0, (
+        f"Online H should have some sparsity, got {online_sparsity:.2%}"
+    )
+    # Influence-boost should also exhibit sparsity
+    assert boost_sparsity > 0.3, (
+        f"Influence-boost H should have some sparsity, got {boost_sparsity:.2%}"
+    )
+
+    # Both should identify the true signal features
+    # For each response, the top-k features by coefficient magnitude should overlap with truth
+    for j in range(m):
+        true_nonzero = set(np.where(np.abs(H_true_dense[j, :]) > 0)[0])
+
+        # Get top-k features by absolute coefficient (k = number of true features)
+        k = len(true_nonzero)
+        lasso_top_k = set(np.argsort(np.abs(H_lasso[j, :].toarray().ravel()))[-k:])
+        online_top_k = set(np.argsort(np.abs(H_online[j, :].toarray().ravel()))[-k:])
+        boost_top_k = set(np.argsort(np.abs(H_boost[j, :].toarray().ravel()))[-k:])
+
+        # Both methods should identify at least 2 of 3 true features
+        lasso_overlap = len(lasso_top_k & true_nonzero)
+        online_overlap = len(online_top_k & true_nonzero)
+        boost_overlap = len(boost_top_k & true_nonzero)
+
+        assert lasso_overlap >= 2, (
+            f"LASSO should identify at least 2/{k} true features for response {j}, "
+            f"got {lasso_overlap}"
+        )
+        assert online_overlap >= 2, (
+            f"Online learning should identify at least 2/{k} true features for response {j}, "
+            f"got {online_overlap}"
+        )
+        assert boost_overlap >= 2, (
+            f"Influence-boost should identify at least 2/{k} true features for response {j}, "
+            f"got {boost_overlap}"
+        )
+
+    # Both methods should produce predictions that correlate well with ground truth
+    Y_true = U @ H_true.T
+    Y_pred_lasso = U @ H_lasso.T
+    Y_pred_online = U @ H_online.T
+    Y_pred_boost = U @ H_boost.T
+
+    for j in range(m):
+        # Correlation with ground truth (how well did we learn the true relationship?)
+        corr_lasso_true = np.corrcoef(Y_pred_lasso[:, j], Y_true[:, j])[0, 1]
+        corr_online_true = np.corrcoef(Y_pred_online[:, j], Y_true[:, j])[0, 1]
+        corr_boost_true = np.corrcoef(Y_pred_boost[:, j], Y_true[:, j])[0, 1]
+
+        assert corr_lasso_true > 0.99, (
+            f"LASSO predictions should correlate with truth for response {j}, "
+            f"got r={corr_lasso_true:.3f}"
+        )
+        assert corr_online_true > 0.99, (
+            f"Online predictions should correlate with truth for response {j}, "
+            f"got r={corr_online_true:.3f}"
+        )
+        assert corr_boost_true > 0.99, (
+            f"Influence-boost predictions should correlate with truth for response {j}, "
+            f"got r={corr_boost_true:.3f}"
+        )
+
+        # The two methods should also agree with each other
+        corr_methods_lasso_online = np.corrcoef(
+            Y_pred_lasso[:, j], Y_pred_online[:, j]
+        )[0, 1]
+        corr_methods_lasso_boost = np.corrcoef(Y_pred_lasso[:, j], Y_pred_boost[:, j])[
+            0, 1
+        ]
+        corr_methods_online_boost = np.corrcoef(
+            Y_pred_online[:, j], Y_pred_boost[:, j]
+        )[0, 1]
+
+        assert corr_methods_lasso_online > 0.99, (
+            f"LASSO and online predictions should correlate for response {j}, "
+            f"got r={corr_methods_lasso_online:.3f}"
+        )
+        assert corr_methods_lasso_boost > 0.99, (
+            f"LASSO and influence-boost predictions should correlate for response {j}, "
+            f"got r={corr_methods_lasso_boost:.3f}"
+        )
+        assert corr_methods_online_boost > 0.99, (
+            f"Online and influence-boost predictions should correlate for response {j}, "
+            f"got r={corr_methods_online_boost:.3f}"
+        )

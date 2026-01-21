@@ -75,6 +75,9 @@ class EnIF:
         self.H = H
         self.unexplained_variance: np.ndarray | None = None
 
+        # Optional incremental learner for H
+        self._incremental_regressor: lr.IncrementalSparseRegressor | None = None
+
         # Convenience for re-use of cholesky and ordering
         self.Graph_C: nx.Graph | None = None
         self.perm_compose: np.ndarray | None = None
@@ -190,7 +193,25 @@ class EnIF:
         verbose_level: int = 0,
     ) -> None:
         """
-        Estimate H from data U using (sparse) linear regression
+        Estimate H from data U using (sparse) linear regression.
+
+        Parameters
+        ----------
+        U : np.ndarray
+            2D array of predictors with shape (n, p).
+        Y : np.ndarray
+            2D array of responses with shape (n, m).
+        learning_algorithm : str, default="LASSO"
+            Algorithm to use. Options:
+            - "LASSO": Standard LASSO with cross-validation
+            - "influence-boost": Boosted regression with IC stopping
+        verbose_level : int, default=0
+            Verbosity level.
+
+        See Also
+        --------
+        init_partial_fit_H, partial_fit_H, finalize_fit_H :
+            For online/streaming learning when data is too large to fit in memory.
         """
         if learning_algorithm == "LASSO":
             self.H = lr.linear_l1_regression(U, Y, verbose_level=verbose_level - 1)
@@ -201,9 +222,163 @@ class EnIF:
         else:
             raise ValueError(
                 f"Argument `learning_algorithm` must be a valid type. "
-                f"Got: {learning_algorithm}"
+                f"Got: {learning_algorithm}. "
+                f"Options: 'LASSO', 'influence-boost'"
             )
         self.residual_variance(U, Y, verbose_level=verbose_level - 1)
+
+    def init_partial_fit_H(
+        self,
+        p: int,
+        m: int,
+        alpha: float = 0.0001,
+        l1_ratio: float = 0.9,
+        random_state: int | None = None,
+        sparsity_threshold: float = 1e-4,
+        verbose_level: int = 0,
+    ) -> None:
+        """
+        Initialize incremental sparse regression for H.
+
+        Call this before using partial_fit_scaler_H() and partial_fit_H() to
+        stream data in batches. After all batches are processed, call
+        finalize_fit_H() to build H.
+
+        Parameters
+        ----------
+        p : int
+            Number of features (columns in U).
+        m : int
+            Number of response variables (columns in Y).
+        alpha : float, default=0.0001
+            Regularization strength. Higher values encourage sparser solutions.
+        l1_ratio : float, default=0.9
+            ElasticNet mixing parameter. 1.0=pure L1 (LASSO), 0.0=pure L2 (Ridge).
+        random_state : int, optional
+            Random seed passed to the underlying SGD regressors.
+        sparsity_threshold : float, default=1e-4
+            Coefficients below this threshold are set to zero in finalize_fit_H.
+        verbose_level : int, default=0
+            Verbosity level.
+
+        Notes
+        -----
+        This method uses a **two-pass workflow** with Welford's algorithm:
+
+        1. **Pass 1 (Statistics)**: Call partial_fit_scaler_H() on all data to
+           compute global mean and variance.
+        2. **Pass 2 (Training)**: Call partial_fit_H() on all data to train the
+           model using the frozen statistics from Pass 1.
+
+        Examples
+        --------
+        >>> enif.init_partial_fit_H(p=500, m=100, alpha=0.001)
+        >>> # Pass 1: Compute global statistics
+        >>> for U_batch, Y_batch in data_loader:
+        ...     enif.partial_fit_scaler_H(U_batch, Y_batch)
+        >>> # Pass 2: Train the model
+        >>> for U_batch, Y_batch in data_loader:
+        ...     enif.partial_fit_H(U_batch, Y_batch)
+        >>> enif.finalize_fit_H()
+        """
+        self._incremental_regressor = lr.IncrementalSparseRegressor(
+            p=p,
+            m=m,
+            alpha=alpha,
+            l1_ratio=l1_ratio,
+            random_state=random_state,
+            sparsity_threshold=sparsity_threshold,
+            verbose_level=verbose_level,
+        )
+        if verbose_level > 0:
+            print(f"Initialized incremental sparse regressor for H of shape ({m}, {p})")
+
+    def partial_fit_scaler_H(
+        self,
+        U_batch: np.ndarray,
+        Y_batch: np.ndarray,
+    ) -> None:
+        """
+        Update the feature scaler with a batch of data without training.
+
+        This is Pass 1 of the two-pass workflow: iterate over all data to
+        compute global mean and variance using Welford's online algorithm.
+
+        Must call init_partial_fit_H() first.
+
+        Parameters
+        ----------
+        U_batch : np.ndarray
+            2D array of predictors with shape (batch_size, p).
+        Y_batch : np.ndarray
+            2D array of responses with shape (batch_size, m).
+        """
+        if self._incremental_regressor is None:
+            raise RuntimeError(
+                "Must call init_partial_fit_H() before partial_fit_scaler_H()"
+            )
+        self._incremental_regressor.partial_fit_scaler(U_batch, Y_batch)
+
+    def partial_fit_H(
+        self,
+        U_batch: np.ndarray,
+        Y_batch: np.ndarray,
+    ) -> None:
+        """
+        Incrementally fit H with a batch of data.
+
+        This is Pass 2 of the two-pass workflow. On the first call, the scaler
+        is frozen using statistics from partial_fit_scaler_H() calls (Pass 1),
+        then training proceeds.
+
+        Must call init_partial_fit_H() and partial_fit_scaler_H() first.
+
+        Parameters
+        ----------
+        U_batch : np.ndarray
+            2D array of predictors with shape (batch_size, p).
+        Y_batch : np.ndarray
+            2D array of responses with shape (batch_size, m).
+        """
+        if self._incremental_regressor is None:
+            raise RuntimeError("Must call init_partial_fit_H() before partial_fit_H()")
+        self._incremental_regressor.partial_fit(U_batch, Y_batch)
+
+    def finalize_fit_H(
+        self,
+        U_sample: np.ndarray | None = None,
+        Y_sample: np.ndarray | None = None,
+        verbose_level: int = 0,
+    ) -> None:
+        """
+        Finalize incremental fitting and build the sparse H matrix.
+
+        Must call init_partial_fit_H() and partial_fit_H() first.
+
+        Parameters
+        ----------
+        U_sample : np.ndarray, optional
+            Sample of U for computing residual variance. If not provided,
+            unexplained_variance will not be computed.
+        Y_sample : np.ndarray, optional
+            Sample of Y for computing residual variance.
+        verbose_level : int, default=0
+            Verbosity level.
+        """
+        if self._incremental_regressor is None:
+            raise RuntimeError(
+                "Must call init_partial_fit_H() and partial_fit_H() before finalize_fit_H()"
+            )
+        self.H = self._incremental_regressor.finalize(verbose_level=verbose_level)
+        self._incremental_regressor = None  # Free memory
+
+        if U_sample is not None and Y_sample is not None:
+            self.residual_variance(U_sample, Y_sample, verbose_level=verbose_level - 1)
+        elif verbose_level > 0:
+            print(
+                "Note: unexplained_variance not computed. "
+                "Call residual_variance() with sample data if needed."
+            )
 
     def pushforward_to_canonical(
         self, U: np.ndarray, verbose_level: int = 0

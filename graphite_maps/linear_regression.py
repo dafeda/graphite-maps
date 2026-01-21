@@ -3,9 +3,10 @@ import scipy.sparse as sp
 from scipy.integrate import quad
 from scipy.sparse import spmatrix
 from scipy.stats import chi2
-from sklearn.linear_model import LassoCV
+from sklearn.linear_model import LassoCV, SGDRegressor
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
+from welford import Welford
 
 
 def linear_l1_regression(U, Y, verbose_level: int = 0):
@@ -87,6 +88,289 @@ def linear_l1_regression(U, Y, verbose_level: int = 0):
         )
 
     return H_sparse
+
+
+class IncrementalSparseRegressor:
+    """Incremental sparse regression using SGD with ElasticNet penalty.
+
+    This class provides an sklearn-style partial_fit interface for learning
+    sparse linear regression coefficients when data is too large to fit in
+    memory.
+
+    Parameters
+    ----------
+    p : int
+        Number of features (columns in U).
+    m : int
+        Number of response variables (columns in Y).
+    alpha : float, default=0.0001
+        Regularization strength. Higher values encourage sparser solutions.
+    l1_ratio : float, default=0.9
+        ElasticNet mixing parameter. l1_ratio=1 is pure L1 (LASSO),
+        l1_ratio=0 is pure L2 (Ridge). Values between give elastic net.
+    sparsity_threshold : float, default=1e-4
+        Coefficients with absolute value below this threshold are set to zero
+        when finalize() is called.
+    verbose_level : int, default=0
+        Verbosity level for progress reporting.
+
+    Examples
+    --------
+    Two-pass workflow:
+
+    >>> regressor = IncrementalSparseRegressor(p=500, m=100)
+    >>> # Pass 1: Compute global statistics
+    >>> for U_batch, Y_batch in data_loader:
+    ...     regressor.partial_fit_scaler(U_batch, Y_batch)
+    >>> # Pass 2: Train the model
+    >>> for U_batch, Y_batch in data_loader:
+    ...     regressor.partial_fit(U_batch, Y_batch)
+    >>> H = regressor.finalize()
+
+    Notes
+    -----
+    **Two-Pass Workflow with Welford's Algorithm**
+
+    This class uses a two-pass approach to solve the "moving target" problem
+    in online regularized regression.
+
+    In sparse regression (LASSO/ElasticNet), features must be scaled/standardized
+    (z-score) so that the regularization penalty treats all features equally.
+    However, in an online setting, the sample mean and standard deviation are not
+    known a priori.
+
+    The two-pass approach:
+    1.  **Pass 1 (Statistics)**: Call partial_fit_scaler() on all data to compute
+        global mean and variance using Welford's online algorithm.
+    2.  **Pass 2 (Training)**: Call partial_fit() on all data. On the first call,
+        the scaler is frozen using the statistics from Pass 1, then training
+        proceeds with a fixed coordinate system.
+    """
+
+    def __init__(
+        self,
+        p: int,
+        m: int,
+        alpha: float = 0.0001,
+        l1_ratio: float = 0.9,
+        random_state: int | None = None,
+        sparsity_threshold: float = 1e-4,
+        verbose_level: int = 0,
+    ):
+        self.p = p
+        self.m = m
+        self.alpha = alpha
+        self.l1_ratio = l1_ratio
+        self.random_state = random_state
+        self.sparsity_threshold = sparsity_threshold
+        self.verbose_level = verbose_level
+
+        # Running statistics for standardization using Welford's algorithm
+        self._welford_u = Welford()
+        self._welford_y = Welford()
+        self._mean_u: np.ndarray | None = None
+        self._mean_y: np.ndarray | None = None
+        self._std_u: np.ndarray | None = None
+        self._std_y: np.ndarray | None = None
+
+        self._scaler_frozen = False
+
+        # SGD models (one per response variable)
+        self._models: list[SGDRegressor] | None = None
+        self._is_finalized = False
+
+    def _update_scaler_stats(self, U_batch: np.ndarray, Y_batch: np.ndarray) -> None:
+        """Update running statistics using Welford's algorithm."""
+        self._welford_u.add_all(U_batch, backup_flg=False)
+        self._welford_y.add_all(Y_batch, backup_flg=False)
+
+    def _validate_batch_shapes(self, U_batch: np.ndarray, Y_batch: np.ndarray) -> None:
+        """Validate that batch shapes match expected dimensions."""
+        batch_n, batch_p = U_batch.shape
+        batch_n_y, batch_m = Y_batch.shape
+
+        assert batch_p == self.p, f"Expected {self.p} features, got {batch_p}"
+        assert batch_m == self.m, f"Expected {self.m} responses, got {batch_m}"
+        assert batch_n == batch_n_y, "U_batch and Y_batch must have same number of rows"
+
+    def partial_fit_scaler(self, U_batch: np.ndarray, Y_batch: np.ndarray) -> None:
+        """Update scaling statistics without training the model.
+
+        This is Pass 1 of the two-pass workflow: iterate over all data to
+        compute global mean and variance using Welford's online algorithm.
+
+        Parameters
+        ----------
+        U_batch : np.ndarray
+            2D array of predictors with shape (batch_size, p).
+        Y_batch : np.ndarray
+            2D array of responses with shape (batch_size, m).
+        """
+        if self._scaler_frozen:
+            raise RuntimeError("Cannot update scaler after training has started")
+
+        self._validate_batch_shapes(U_batch, Y_batch)
+        self._update_scaler_stats(U_batch, Y_batch)
+
+    def partial_fit(
+        self, U_batch: np.ndarray, Y_batch: np.ndarray
+    ) -> "IncrementalSparseRegressor":
+        """Incrementally fit the regressor with a batch of data.
+
+        This is Pass 2 of the two-pass workflow. On the first call, the scaler
+        is frozen using statistics from partial_fit_scaler() calls (Pass 1),
+        then training proceeds.
+
+        Parameters
+        ----------
+        U_batch : np.ndarray
+            2D array of predictors with shape (batch_size, p).
+        Y_batch : np.ndarray
+            2D array of responses with shape (batch_size, m).
+
+        Returns
+        -------
+        self : IncrementalSparseRegressor
+            Returns self for method chaining.
+
+        Raises
+        ------
+        RuntimeError
+            If partial_fit_scaler() was not called before partial_fit().
+        """
+        if self._is_finalized:
+            raise RuntimeError("Cannot call partial_fit after finalize()")
+
+        self._validate_batch_shapes(U_batch, Y_batch)
+
+        if not self._scaler_frozen:
+            if self._welford_u.count <= 0:
+                raise RuntimeError(
+                    "Must call partial_fit_scaler() before partial_fit(). "
+                    "Use a two-pass workflow: Pass 1 computes statistics, "
+                    "Pass 2 trains the model."
+                )
+            self._freeze_scaler_and_initialize_models()
+
+        self._train_on_batch(U_batch, Y_batch)
+        return self
+
+    def _freeze_scaler_and_initialize_models(self) -> None:
+        if self._scaler_frozen:
+            return
+        if self._welford_u.count <= 0:
+            raise RuntimeError("Cannot freeze scaler before observing any samples")
+
+        # Extract statistics from Welford accumulators
+        self._mean_u = self._welford_u.mean.copy()
+        self._mean_y = self._welford_y.mean.copy()
+
+        # Use population variance (var_p) since we want to standardize with the
+        # actual observed variance, not an unbiased estimate
+        std_u = np.sqrt(self._welford_u.var_p)
+        std_y = np.sqrt(self._welford_y.var_p)
+
+        # Avoid division by zero for constant features
+        std_u[std_u < 1e-10] = 1.0
+        std_y[std_y < 1e-10] = 1.0
+
+        self._std_u = std_u
+        self._std_y = std_y
+
+        if self._models is None:
+            self._models = [
+                SGDRegressor(
+                    loss="squared_error",
+                    penalty="elasticnet",
+                    alpha=self.alpha,
+                    l1_ratio=self.l1_ratio,
+                    fit_intercept=False,
+                    max_iter=1,
+                    tol=None,
+                    warm_start=True,
+                    random_state=self.random_state,
+                )
+                for _ in range(self.m)
+            ]
+
+        self._scaler_frozen = True
+
+    def _train_on_batch(self, U_batch: np.ndarray, Y_batch: np.ndarray) -> None:
+        if self._models is None:
+            raise RuntimeError("Internal error: models not initialized")
+        if self._std_u is None or self._std_y is None:
+            raise RuntimeError("Internal error: scaler not initialized")
+        if self._mean_u is None or self._mean_y is None:
+            raise RuntimeError("Internal error: mean not initialized")
+
+        U_scaled = (U_batch - self._mean_u) / self._std_u
+        Y_scaled = (Y_batch - self._mean_y) / self._std_y
+
+        for j in range(self.m):
+            self._models[j].partial_fit(U_scaled, Y_scaled[:, j])
+
+    def finalize(self, verbose_level: int | None = None) -> spmatrix:
+        """Build the final sparse coefficient matrix.
+
+        Parameters
+        ----------
+        verbose_level : int, optional
+            Override instance verbose_level for this call.
+
+        Returns
+        -------
+        H_sparse : scipy.sparse.csc_matrix
+            Sparse matrix (m, p) with regression coefficients.
+        """
+        if self._is_finalized:
+            raise RuntimeError("finalize() has already been called")
+        if self._models is None:
+            raise RuntimeError(
+                "Must call partial_fit() at least once before finalize()"
+            )
+
+        if not self._scaler_frozen:
+            raise RuntimeError(
+                "Must call partial_fit() at least once before finalize()"
+            )
+
+        verbose = verbose_level if verbose_level is not None else self.verbose_level
+
+        # These are guaranteed to be set after partial_fit() is called
+        assert self._std_u is not None and self._std_y is not None
+
+        # Extract coefficients and build sparse matrix
+        i_H, j_H, values_H = [], [], []
+        for j in range(self.m):
+            coefficients = self._models[j].coef_
+
+            # Re-scale coefficients to original scale
+            scaled_coefs = self._std_y[j] * coefficients / self._std_u
+
+            # Apply sparsity threshold and extract non-zeros
+            for i, coef in enumerate(scaled_coefs):
+                if np.abs(coef) > self.sparsity_threshold:
+                    i_H.append(j)
+                    j_H.append(i)
+                    values_H.append(coef)
+
+        H_sparse = sp.csc_matrix(
+            (np.array(values_H), (np.array(i_H), np.array(j_H))),
+            shape=(self.m, self.p),
+        )
+
+        if verbose > 0:
+            print(
+                f"Finalized sparse H matrix:\n"
+                f"  Total elements: {self.m * self.p}\n"
+                f"  Non-zero elements: {H_sparse.nnz}\n"
+                f"  Fraction of non-zeros: {H_sparse.nnz / (self.m * self.p):.6f}"
+            )
+
+        self._is_finalized = True
+        self._models = None  # Free memory
+
+        return H_sparse
 
 
 def expected_max_chisq(p):

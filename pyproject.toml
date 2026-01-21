@@ -17,6 +17,7 @@ dependencies = [
     "scikit-learn",
     "networkx",
     "tqdm",
+    "welford>=0.2.5",
 ]
 dynamic = ["version"]
 
