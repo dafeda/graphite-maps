@@ -1,6 +1,8 @@
 import numpy as np
 import pytest
-from graphite_maps.linear_regression import boost_linear_regression
+from graphite_maps.linear_regression import (
+    boost_linear_regression,
+)
 from sklearn.metrics import mean_squared_error
 from sklearn.preprocessing import StandardScaler
 

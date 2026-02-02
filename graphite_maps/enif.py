@@ -196,7 +196,7 @@ class EnIF:
             self.H = lr.linear_l1_regression(U, Y, verbose_level=verbose_level - 1)
         elif learning_algorithm == "influence-boost":
             self.H = lr.linear_boost_ic_regression(
-                U, Y, verbose_level=verbose_level - 1
+                U, Y, verbose_level=verbose_level - 1, use_isis=True
             )
         else:
             raise ValueError(

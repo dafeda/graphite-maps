@@ -80,7 +80,9 @@ def test_that_posterior_low_level_api_equals_high_level_api(n, p, phi):
     gtmap_lowlevel = EnIF(Graph_u=Graph_u, Prec_eps=Prec_eps, H=H)
     gtmap_lowlevel.fit_precision(U)
     if gtmap_lowlevel.H is None:
-        gtmap_lowlevel.fit_H(U, U @ H.T)  # simulations Y = U@H.T
+        gtmap_lowlevel.fit_H(
+            U, U @ H.T, learning_algorithm="influence-boost"
+        )  # simulations Y = U@H.T
     canonical = gtmap_lowlevel.pushforward_to_canonical(U)
     # Work out residuals and associate unexplained variance
     residual = gtmap_lowlevel.response_residual(U, Y)
@@ -118,7 +120,7 @@ def test_that_enif_equals_kalman_under_exact_precision_and_H(n, p, phi):
 
     # EnIF high-level API with known precision
     gtmap = EnIF(Prec_u=Prec_u, Prec_eps=Prec_eps, H=H)
-    gtmap.fit(U, verbose_level=4)
+    gtmap.fit(U, verbose_level=4, learning_algorithm="influence-boost")
     U_posterior_enif = gtmap.transport(U, Y, d, seed=42, verbose_level=10)
 
     # Create Kalman update -- use same noise
